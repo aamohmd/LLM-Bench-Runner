@@ -35,7 +35,7 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Fixed generation settings (do not vary these between runs)
+# Default generation settings; CLI overrides are recorded with each result.
 GENERATION_OPTIONS = {
     "temperature": 0,
     "seed": 42,
@@ -316,7 +316,10 @@ def model_metadata(model: str) -> dict:
             "/api/show", json={"name": model}, timeout=30
         )
         details.raise_for_status()
-        metadata.update(details.json().get("details", {}))
+        reported = details.json().get("details", {})
+        metadata.update(reported)
+        if reported.get("quantization_level"):
+            metadata["quantization"] = reported["quantization_level"]
     except (requests.RequestException, ValueError):
         pass
     return metadata
@@ -337,6 +340,20 @@ def loaded_model_memory_mb(model: str) -> Optional[float]:
     return None
 
 
+def loaded_model_context_length(model: str) -> int | None:
+    """Observed allocation, never substitute the requested context for a measurement."""
+    try:
+        response = CLIENT.get("/api/ps", timeout=10)
+        response.raise_for_status()
+        for item in response.json().get("models", []):
+            value = item.get("context_length")
+            if item.get("name") == model and isinstance(value, int) and value > 0:
+                return value
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Core measurement
 # ---------------------------------------------------------------------------
@@ -352,6 +369,7 @@ def _measure_once(
     store_response: bool = False,
     min_ctx: int | None = None,
     sampling: dict | None = None,
+    response_format: str = "text",
     max_output_tokens: int | None = None,
     generation_timeout_seconds: int = 120,
 ) -> dict:
@@ -396,6 +414,11 @@ def _measure_once(
         "stream": True,
         "options": gen_opts,
     }
+
+    if response_format not in {"text", "json"}:
+        raise ValueError("response_format must be text or json")
+    if response_format == "json":
+        payload["format"] = "json"
 
     t_start = time.perf_counter()
     t_first_token: Optional[float] = None
@@ -560,7 +583,7 @@ def _measure_once(
         "response_preview": content_str[:120].replace("\n", " "),
         "response": content_str if store_response else "",
         "task_id": task_id,
-        "context_len": min_ctx,
+        "context_len": loaded_model_context_length(model),
         "attempt_count": attempt + 1,
         "error": None
     }
@@ -575,6 +598,7 @@ def run_benchmark(
     store_responses: bool = False,
     min_ctx: int | None = None,
     sampling: dict | None = None,
+    response_format: str = "text",
     prompt_strategy: str | None = None,
     custom_system_prompt: str | None = None,
     max_output_tokens: int = 512,
@@ -601,6 +625,7 @@ def run_benchmark(
         min_ctx=min_ctx,
         store_responses=store_responses,
         sampling=sampling,
+        response_format=response_format,
         prompt_strategy=prompt_strategy,
         custom_system_prompt=custom_system_prompt,
         max_output_tokens=max_output_tokens,
@@ -616,6 +641,7 @@ def run_quality_suite(
     min_ctx: int | None = None,
     store_responses: bool = True,
     sampling: dict | None = None,
+    response_format: str = "text",
     prompt_strategy: str | None = None,
     custom_system_prompt: str | None = None,
     max_output_tokens: int = 512,
@@ -693,6 +719,7 @@ def run_quality_suite(
                 store_response=store_responses,
                 min_ctx=min_ctx,
                 sampling=sampling,
+                response_format=response_format,
                 max_output_tokens=max_output_tokens,
                 generation_timeout_seconds=generation_timeout_seconds,
             )

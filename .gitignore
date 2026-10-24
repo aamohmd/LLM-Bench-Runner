@@ -16,4 +16,26 @@ dist/
 logs/
 *.gguf
 .DS_Store
-tests/
+coverage.xml
+htmlcov/
+junit*.xml
+
+# Keep personal work and credentials local; synthetic regression tests are public.
+.local/
+.private/
+private/
+.codex/
+.agents/
+.claude/
+.opencode/
+.idea/
+.vscode/
+*.pem
+*.key
+*.dump
+*.log
+*.zip
+*.db
+*.sqlite*
+.ruff_cache/
+.mypy_cache/

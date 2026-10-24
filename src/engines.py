@@ -155,8 +155,12 @@ def post_with_retry(
             return resp
         last_resp = resp
         if attempt < retries:
+            resp.close()
             time.sleep(backoff * (2 ** attempt))
-    last_resp.raise_for_status()
+    try:
+        last_resp.raise_for_status()
+    finally:
+        last_resp.close()
     return last_resp
 
 class EngineConfig(TypedDict):
@@ -219,6 +223,7 @@ def run_vllm(
     store_responses: bool = False,
     min_ctx: int | None = None,
     sampling: dict | None = None,
+    response_format: str = "text",
     prompt_strategy: str | None = None,
     custom_system_prompt: str | None = None,
     max_output_tokens: int = 512,
@@ -234,6 +239,8 @@ def run_vllm(
     )
     if mode != "warm":
         raise ValueError("vLLM benchmarks support only mode='warm'; cold mode requires restarting the server")
+    if response_format not in {"text", "json"}:
+        raise ValueError("response_format must be text or json")
     if max_output_tokens < 1:
         raise ValueError("max_output_tokens must be at least 1")
     if generation_timeout_seconds < 0:
@@ -259,10 +266,11 @@ def run_vllm(
         m_list = models_resp.json().get("data", [])
         if not isinstance(m_list, list):
             raise ValueError("models response data is not a list")
-        for m_item in m_list:
-            if m_item.get("id") == model or not server_max_model_len:
-                if "max_model_len" in m_item and m_item["max_model_len"]:
-                    server_max_model_len = int(m_item["max_model_len"])
+        matched = next((item for item in m_list if item.get("id") == model), None)
+        if matched is None:
+            raise ValueError(f"Requested model {model!r} is not served by this endpoint")
+        if matched.get("max_model_len"):
+            server_max_model_len = int(matched["max_model_len"])
     except (requests.RequestException, TypeError, ValueError, AttributeError) as exc:
         raise RuntimeError(
             f"vLLM preflight failed at {base_url}/models; configure the server root "
@@ -371,6 +379,8 @@ def run_vllm(
                         "max_tokens": safe_max_tokens,
                         "seed": 42
                     }
+                    if response_format == "json":
+                        payload["response_format"] = {"type": "json_object"}
                     if sampling:
                         payload.update(sampling)
                     # vLLM key_by_engine is None → apply_context_window is a no-op here;

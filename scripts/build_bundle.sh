@@ -9,11 +9,13 @@ BUNDLE_DIR="$DIST_DIR/$BUNDLE_NAME"
 ZIP_FILE="$DIST_DIR/$BUNDLE_NAME.zip"
 
 rm -rf "$BUNDLE_DIR" "$ZIP_FILE"
-mkdir -p "$BUNDLE_DIR/scripts"
+mkdir -p "$BUNDLE_DIR/scripts" "$BUNDLE_DIR/src" "$BUNDLE_DIR/benchmark_scoring"
 
-cp -R "$BENCHMARK_ROOT/src" "$BUNDLE_DIR/src"
-cp -R "$BENCHMARK_ROOT/benchmark_scoring" "$BUNDLE_DIR/benchmark_scoring"
+cp "$BENCHMARK_ROOT"/src/*.py "$BUNDLE_DIR/src/"
+cp "$BENCHMARK_ROOT"/benchmark_scoring/*.py "$BUNDLE_DIR/benchmark_scoring/"
 cp "$SCRIPT_DIR/run_remote_benchmark.py" "$BUNDLE_DIR/scripts/"
+cp "$SCRIPT_DIR/setup.sh" "$SCRIPT_DIR/run.sh" "$BUNDLE_DIR/scripts/"
+cp "$BENCHMARK_ROOT/.env.example" "$BUNDLE_DIR/"
 cp "$BENCHMARK_ROOT/requirements.txt" "$BUNDLE_DIR/requirements.txt"
 cp "$BENCHMARK_ROOT/README.md" "$BENCHMARK_ROOT/LICENSE" "$BUNDLE_DIR/"
 if REVISION="$(git -C "$BENCHMARK_ROOT" rev-parse --short HEAD 2>/dev/null)"; then

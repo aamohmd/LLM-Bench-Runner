@@ -7,6 +7,8 @@ Falls back to local JSON save if the backend network request fails.
 """
 
 import argparse
+from contextlib import ExitStack
+import math
 import sys
 import os
 import requests
@@ -15,6 +17,7 @@ import subprocess
 import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
+from urllib.parse import urlsplit
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -26,12 +29,31 @@ except ImportError:
     questionary = None
 
 def _check_interactive():
+    if not sys.stdin.isatty():
+        print("Error: This command needs more arguments. Supply the missing CLI flags; interactive prompts require a terminal.", file=sys.stderr)
+        raise SystemExit(2)
     if questionary is None:
         print("Error: Missing required CLI arguments, and 'questionary' is not installed for interactive prompts.")
         print("Please provide all CLI flags (e.g. model, --engine, --suite, --backend-url, --api-key) or install questionary: pip install questionary")
         sys.exit(1)
 
-from urllib.parse import urlsplit
+
+def _ask(prompt):
+    value = prompt.ask()
+    if value is None:
+        print("Cancelled. No further benchmark tasks were started.", file=sys.stderr)
+        raise SystemExit(130)
+    return value
+
+
+def _validate_backend_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    parsed = urlsplit(value)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("Backend URL must be an http:// or https:// address without credentials, query parameters or fragments")
+    _ = parsed.port
+    return value
 
 # Load only this checkout's configuration before initializing engine clients.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
@@ -129,7 +151,7 @@ def _check_submission_readiness(backend_url: str, api_key: str) -> dict:
     """Fail before inference when result ingestion is incompatible or unavailable."""
     url = f"{backend_url.rstrip('/')}/api/v1/benchmark-results/readiness"
     try:
-        response = requests.get(url, headers={"X-API-Key": api_key}, timeout=15)
+        response = requests.get(url, headers={"X-API-Key": api_key}, timeout=15, allow_redirects=False)
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(
             f"Cannot verify result ingestion ({type(exc).__name__}). "
@@ -224,7 +246,7 @@ def _validate_benchmark_tasks(tasks: list[dict]) -> None:
 def get_ollama_models():
     """Run `ollama list` and parse the model names."""
     try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True, timeout=10)
         lines = result.stdout.strip().split("\n")[1:] # Skip header
         models = [line.split()[0] for line in lines if line]
         return models
@@ -235,7 +257,7 @@ def fetch_backend_suites(backend_url: str, api_key: str | None = None) -> list[d
     """Fetch registered benchmark suites from the control plane."""
     try:
         headers = {"X-API-Key": api_key} if api_key else {}
-        resp = requests.get(f"{backend_url.rstrip('/')}/api/v1/suites", headers=headers, timeout=5)
+        resp = requests.get(f"{backend_url.rstrip('/')}/api/v1/suites", headers=headers, timeout=5, allow_redirects=False)
         if resp.status_code == 200:
             return resp.json()
     except Exception as e:
@@ -248,7 +270,7 @@ def fetch_backend_prompts(backend_url: str, api_key: str) -> list[dict]:
     try:
         response = requests.get(
             f"{backend_url.rstrip('/')}/api/v1/prompts",
-            headers={"X-API-Key": api_key}, timeout=5,
+            headers={"X-API-Key": api_key}, timeout=5, allow_redirects=False,
         )
         if response.ok:
             return response.json()
@@ -265,6 +287,7 @@ def fetch_backend_strategies(backend_url: str, api_key: str) -> list[dict]:
             f"{backend_url.rstrip('/')}/api/v1/strategies",
             headers={"X-API-Key": api_key},
             timeout=5,
+            allow_redirects=False,
         )
         if response.ok:
             payload = response.json()
@@ -282,7 +305,7 @@ def fetch_backend_suite_tasks(backend_url: str, suite_id: str, api_key: str | No
     """Fetch task definitions for a specific suite from the control plane."""
     try:
         headers = {"X-API-Key": api_key} if api_key else {}
-        resp = requests.get(f"{backend_url.rstrip('/')}/api/v1/suites/{suite_id}/tasks", headers=headers, timeout=15)
+        resp = requests.get(f"{backend_url.rstrip('/')}/api/v1/suites/{suite_id}/tasks", headers=headers, timeout=15, allow_redirects=False)
         if resp.status_code == 200:
             tasks = resp.json()
             # Ensure any nested scoring_config keys are unpacked at task top level
@@ -308,7 +331,7 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{uuid4().hex}.tmp"
     try:
-        with temporary.open("x") as handle:
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
             json.dump(payload, handle, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
@@ -365,6 +388,7 @@ def _find_legacy_submission(
         params={"limit": 1000, "experiment_tag": experiment_tag},
         headers={"X-API-Key": api_key},
         timeout=(10, timeout_seconds),
+        allow_redirects=False,
     )
     response.raise_for_status()
     rows = response.json()
@@ -404,7 +428,7 @@ def _post_outbox_file(
     api_key: str,
     timeout_seconds: int,
 ) -> tuple[dict, dict]:
-    """Submit one durable outbox entry and remove it only after a 2xx ack."""
+    """Remove a durable entry only after a valid stored-run acknowledgement."""
     with path.open() as handle:
         payload = json.load(handle)
     if payload.get("submission_id") is None:
@@ -412,7 +436,9 @@ def _post_outbox_file(
             payload, backend_url, api_key, timeout_seconds
         )
         if existing is not None:
-            path.unlink()
+            if not isinstance(existing.get("id"), str) or not existing["id"].strip():
+                raise ValueError("Legacy reconciliation returned no stored run ID; keeping the outbox file")
+            path.unlink(missing_ok=True)
             return payload, {"status": "already_created", "id": existing.get("id")}
     if _ensure_submission_id(payload):
         _atomic_write_json(path, payload)
@@ -422,14 +448,19 @@ def _post_outbox_file(
         json=payload,
         headers={"X-API-Key": api_key, "Content-Type": "application/json"},
         timeout=(10, timeout_seconds),
+        allow_redirects=False,
     )
     response.raise_for_status()
     try:
         acknowledgement = response.json()
-    except ValueError:
-        acknowledgement = {"status": f"submitted_http_{response.status_code}"}
+    except ValueError as exc:
+        raise requests.RequestException("Submission returned no valid storage acknowledgement; keeping the outbox file") from exc
+    if (not 200 <= response.status_code < 300 or not isinstance(acknowledgement, dict)
+            or acknowledgement.get("status") not in {"created", "already_created"}
+            or not isinstance(acknowledgement.get("id"), str) or not acknowledgement["id"].strip()):
+        raise requests.RequestException("Submission did not confirm a stored run ID; keeping the outbox file")
 
-    path.unlink()
+    path.unlink(missing_ok=True)
     return payload, acknowledgement
 
 
@@ -474,7 +505,7 @@ def _replay_fallbacks(
     return submitted, fail
 
 
-def main():
+def _main(resources):
     
     # We still keep argparse for users who want to run it non-interactively
     parser = argparse.ArgumentParser(description="Run benchmark and submit to remote control plane")
@@ -569,8 +600,62 @@ def main():
         help="OpenAI-compatible API base URL (defaults to OPENAI_BASE_URL or the OpenAI API)",
     )
 
+    parser.add_argument("--ollama-base-url", help="Ollama server root URL reachable from this runner")
+    parser.add_argument("--temperature", type=float, default=None, help="Request sampling temperature (0..2); default 0")
+    parser.add_argument("--seed", type=_non_negative_int, default=None, help="Request seed; default 42 (not a determinism guarantee)")
+    parser.add_argument("--response-format", choices=("text", "json"), default="text", help="JSON mode requires JSON-compatible tasks and references")
+    parser.add_argument("--context-length", type=_positive_int, help="Ollama request context window; automatic when omitted")
+    parser.add_argument("--launch-vllm", action="store_true", help="Start a local vLLM process for this benchmark and stop it on exit; requires an unused explicit --vllm-base-url")
+    parser.add_argument("--vllm-max-model-len", type=_positive_int, help="Managed vLLM server context limit")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, help="Managed vLLM GPU memory fraction, greater than 0 and at most 1")
+    parser.add_argument("--vllm-quantization", help="Managed vLLM quantization method supported by your installed version/model")
+    parser.add_argument("--vllm-kv-cache-dtype", help="Managed vLLM KV cache dtype supported by your installed version/hardware")
+    parser.add_argument("--vllm-prefix-caching", choices=("enabled", "disabled"), help="Managed vLLM prefix cache; omitted uses engine default")
+    parser.add_argument("--vllm-startup-timeout", type=_positive_int, default=600, help="Managed vLLM startup deadline in seconds")
+
     args = parser.parse_args()
 
+    if args.engine == "ollama" and os.environ.get("OLLAMA_NUM_PARALLEL"):
+        try:
+            _positive_int(os.environ["OLLAMA_NUM_PARALLEL"])
+        except (ValueError, argparse.ArgumentTypeError):
+            parser.error("OLLAMA_NUM_PARALLEL must be a positive whole number")
+
+    if args.temperature is not None and (not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2):
+        parser.error("--temperature must be a finite value between 0 and 2")
+    memory_fraction = args.vllm_gpu_memory_utilization
+    if memory_fraction is not None and (not math.isfinite(memory_fraction) or not 0 < memory_fraction <= 1):
+        parser.error("--vllm-gpu-memory-utilization must be greater than 0 and at most 1")
+    startup_options = {
+        "max_model_len": args.vllm_max_model_len,
+        "gpu_memory_utilization": memory_fraction,
+        "quantization": args.vllm_quantization,
+        "kv_cache_dtype": args.vllm_kv_cache_dtype,
+        "prefix_caching": args.vllm_prefix_caching,
+    }
+    if any(value is not None for value in startup_options.values()) and not args.launch_vllm:
+        parser.error("vLLM startup settings require --launch-vllm; they cannot change an existing server")
+    if args.launch_vllm and (args.engine != "vllm" or not args.vllm_base_url):
+        parser.error("--launch-vllm requires --engine vllm and an explicit unused local --vllm-base-url")
+    if args.context_length is not None and args.engine != "ollama":
+        parser.error("--context-length is Ollama-only; use --vllm-max-model-len with --launch-vllm")
+    if args.decision_mode and (args.temperature is not None or args.seed is not None):
+        parser.error("decision mode defines its own temperature and seeds; omit --temperature and --seed")
+    if args.engine == "openai-compatible" and (args.temperature is not None or args.seed is not None or args.response_format != "text"):
+        parser.error("these request controls currently support vLLM and Ollama only")
+    if args.vllm_quantization and args.quantization and args.vllm_quantization != args.quantization:
+        parser.error("--quantization provenance must match --vllm-quantization")
+
+    if args.ollama_base_url:
+        parsed_ollama = urlsplit(args.ollama_base_url)
+        if (parsed_ollama.scheme not in {"http", "https"} or not parsed_ollama.hostname
+                or parsed_ollama.username or parsed_ollama.password or parsed_ollama.query
+                or parsed_ollama.fragment or parsed_ollama.path.rstrip("/")):
+            parser.error("--ollama-base-url must be an HTTP server root without credentials, path, query, or fragment")
+        os.environ["OLLAMA_BASE_URL"] = args.ollama_base_url.rstrip("/")
+        from src import benchmark
+        benchmark.OLLAMA_BASE_URL = args.ollama_base_url.rstrip("/")
+        benchmark.CLIENT.base_url = benchmark.OLLAMA_BASE_URL
     if args.vllm_base_url:
         os.environ["VLLM_BASE_URL"] = args.vllm_base_url.rstrip("/")
     if args.openai_base_url:
@@ -583,14 +668,23 @@ def main():
         or os.environ.get("BACKEND_URL")
     )
     api_key = args.api_key or os.environ.get("API_KEY")
+    if backend_url:
+        try:
+            backend_url = _validate_backend_url(backend_url)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.replay_fallbacks:
         if not backend_url:
             _check_interactive()
-            backend_url = questionary.text("Enter Backend URL:").ask()
+            backend_url = _ask(questionary.text("Enter Backend URL:"))
         if not api_key:
             _check_interactive()
-            api_key = questionary.password("Enter API Key:").ask()
+            api_key = _ask(questionary.password("Enter API Key:"))
+        try:
+            backend_url = _validate_backend_url(backend_url)
+        except ValueError as exc:
+            parser.error(str(exc))
         try:
             _check_submission_readiness(backend_url, api_key)
         except RuntimeError as exc:
@@ -618,20 +712,28 @@ def main():
 
     if not backend_url:
         _check_interactive()
-        backend_url = questionary.text("Enter Backend URL:").ask()
+        backend_url = _ask(questionary.text("Enter Backend URL:"))
     if not api_key:
         _check_interactive()
-        api_key = questionary.password("Enter API Key:").ask()
+        api_key = _ask(questionary.password("Enter API Key:"))
 
     if not backend_url or not api_key:
         print("Backend URL and API Key are required.")
         sys.exit(1)
 
+    try:
+        backend_url = _validate_backend_url(backend_url)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     from benchmark_scoring.registry import fingerprint
     try:
-        response = requests.get(f"{backend_url.rstrip('/')}/api/v1/scorers/catalog", headers={"X-API-Key": api_key}, timeout=15)
+        response = requests.get(f"{backend_url.rstrip('/')}/api/v1/scorers/catalog", headers={"X-API-Key": api_key}, timeout=15, allow_redirects=False)
         response.raise_for_status()
-        if response.json().get("fingerprint") != fingerprint():
+        catalog = response.json()
+        if not isinstance(catalog, dict):
+            parser.error("Platform scorer catalog is not a JSON object. No benchmark tasks were started.")
+        if catalog.get("fingerprint") != fingerprint():
             parser.error("Platform and runner scoring implementations differ. Install matching releases before benchmarking.")
     except (requests.RequestException, ValueError) as exc:
         parser.error(f"Cannot verify the platform scoring catalog: {exc}")
@@ -652,10 +754,10 @@ def main():
     target_prompt_name = args.prompt
     if not target_prompt_name and sys.stdin.isatty() and registered_prompts:
         _check_interactive()
-        target_prompt_name = questionary.select(
+        target_prompt_name = _ask(questionary.select(
             "Select foundational prompt:",
             choices=[prompt["name"] for prompt in registered_prompts],
-        ).ask()
+        ))
     if not target_prompt_name:
         parser.error(
             "--prompt is required for non-interactive benchmark runs; "
@@ -664,10 +766,10 @@ def main():
     target_strategy = args.prompt_strategy
     if not target_strategy and sys.stdin.isatty() and registered_strategies:
         _check_interactive()
-        target_strategy = questionary.select(
+        target_strategy = _ask(questionary.select(
             "Select prompt strategy:",
             choices=[strategy["name"] for strategy in registered_strategies],
-        ).ask()
+        ))
     if not target_strategy:
         parser.error(
             "--strategy is required for non-interactive benchmark runs; "
@@ -682,6 +784,7 @@ def main():
             params={"prompt": target_prompt_name, "strategy": target_strategy},
             headers={"X-API-Key": api_key},
             timeout=5,
+            allow_redirects=False,
         )
         if resp.ok:
             comp_data = resp.json()
@@ -705,10 +808,10 @@ def main():
     engine = args.engine
     if not engine:
         _check_interactive()
-        engine = questionary.select(
+        engine = _ask(questionary.select(
             "Select inference engine:",
             choices=["ollama", "vllm", "openai-compatible"]
-        ).ask()
+        ))
 
     if args.openai_reasoning_effort and engine != "openai-compatible":
         parser.error("--openai-reasoning-effort requires --engine openai-compatible")
@@ -724,17 +827,17 @@ def main():
         if engine == "ollama":
             available_models = get_ollama_models()
             if available_models:
-                model = questionary.select(
+                model = _ask(questionary.select(
                     "Select model to benchmark:",
                     choices=available_models + ["Other (type manually)"]
-                ).ask()
+                ))
                 
                 if model == "Other (type manually)":
-                    model = questionary.text("Enter model name:").ask()
+                    model = _ask(questionary.text("Enter model name:"))
             else:
-                model = questionary.text("Enter the model name reported by the live engine:").ask()
+                model = _ask(questionary.text("Enter the model name reported by the live engine:"))
         else:
-            model = questionary.text("Enter the model name reported by the live engine:").ask()
+            model = _ask(questionary.text("Enter the model name reported by the live engine:"))
 
     if not model:
         print("Model is required.")
@@ -743,7 +846,7 @@ def main():
     if engine == "openai-compatible" and not os.environ.get("OPENAI_API_KEY", "").strip():
         if sys.stdin.isatty():
             _check_interactive()
-            provider_key = questionary.password("Enter OpenAI-compatible provider API key:").ask()
+            provider_key = _ask(questionary.password("Enter OpenAI-compatible provider API key:"))
             if provider_key:
                 os.environ["OPENAI_API_KEY"] = provider_key
         if not os.environ.get("OPENAI_API_KEY", "").strip():
@@ -768,15 +871,15 @@ def main():
                 choices.append(label)
                 suite_map[label] = s
             choices.append("Legacy category / Other...")
-            selected_choice = questionary.select("Select benchmark suite:", choices=choices).ask()
+            selected_choice = _ask(questionary.select("Select benchmark suite:", choices=choices))
             if selected_choice in suite_map:
                 selected_suite = suite_map[selected_choice]
                 selected_suite_id = selected_suite["id"]
                 suite_name = selected_suite.get("name")
             else:
-                selected_suite_id = questionary.text("Enter benchmark suite or category ID:").ask()
+                selected_suite_id = _ask(questionary.text("Enter benchmark suite or category ID:"))
         else:
-            selected_suite_id = questionary.text("Enter benchmark suite or category ID:").ask()
+            selected_suite_id = _ask(questionary.text("Enter benchmark suite or category ID:"))
 
     category = selected_suite_id
     if selected_suite is None and backend_suites:
@@ -826,11 +929,14 @@ def main():
     concurrency_str = str(args.concurrency) if args.concurrency else ""
     if not concurrency_str:
         _check_interactive()
-        concurrency_str = questionary.text(
+        concurrency_str = _ask(questionary.text(
             "Enter concurrency level:",
             default="1"
-        ).ask()
-    concurrency = int(concurrency_str) if concurrency_str.isdigit() else 1
+        ))
+    try:
+        concurrency = _positive_int(concurrency_str)
+    except (ValueError, argparse.ArgumentTypeError):
+        parser.error("Concurrency must be a positive whole number")
 
     if engine == "openai-compatible":
         from src.openai_compatible import validate_provider_concurrency
@@ -855,10 +961,10 @@ def main():
     mode = args.mode
     if not mode:
         _check_interactive()
-        mode = questionary.select(
+        mode = _ask(questionary.select(
             "Select mode:",
             choices=["warm", "cold"]
-        ).ask()
+        ))
     if engine in {"vllm", "openai-compatible"} and mode == "cold":
         parser.error(f"{engine} benchmarks support only --mode warm")
         
@@ -869,13 +975,16 @@ def main():
         runs = 3
     elif not runs_str:
         _check_interactive()
-        runs_str = questionary.text(
+        runs_str = _ask(questionary.text(
             "Enter number of repetitions (runs):",
             default="1"
-        ).ask()
-        runs = int(runs_str) if runs_str.isdigit() else 1
+        ))
+        try:
+            runs = _positive_int(runs_str)
+        except (ValueError, argparse.ArgumentTypeError):
+            parser.error("Repetitions must be a positive whole number")
     else:
-        runs = int(runs_str) if runs_str.isdigit() else 1
+        runs = args.runs
     
     print(f"\n---", flush=True)
     print(f"Running benchmark for {model} on {engine} with concurrency {concurrency}...", flush=True)
@@ -951,6 +1060,16 @@ def main():
         print(f"✓ Suite '{selected_suite_id}' consists of {len(ordered_benchmarks)} individual benchmark(s):", flush=True)
         for idx, b_name in enumerate(ordered_benchmarks, 1):
             print(f"   [{idx}/{len(ordered_benchmarks)}] {b_name} ({len(benchmark_groups[b_name])} tasks)", flush=True)
+
+        startup_metadata = {"runtime_configuration_source": "external_server"}
+        if args.launch_vllm:
+            from src.runtime_configuration import managed_vllm
+            startup_metadata = resources.enter_context(managed_vllm(
+                model, args.vllm_base_url, startup_options, args.vllm_startup_timeout,
+            ))
+        request_options = ({"response_format": args.response_format} if engine in {"ollama", "vllm"} else {})
+        sampling = {"temperature": args.temperature if args.temperature is not None else 0.0,
+                    "seed": args.seed if args.seed is not None else 42}
 
         # Prepare hardware info before benchmark execution
         if hardware_info is None and engine != "openai-compatible":
@@ -1045,8 +1164,10 @@ def main():
                 len((t.get("prompt") or t.get("user") or "").encode("utf-8"))
                 for t in bench_tasks
             )
-            needed_tokens = max_prompt_bytes + args.max_output_tokens + 128
-            bench_min_ctx = max(needed_tokens, 4096)
+            needed_tokens = max_prompt_bytes + len((selected_prompt["system_prompt"] if selected_prompt else "").encode("utf-8")) + args.max_output_tokens + 128
+            bench_min_ctx = args.context_length or max(needed_tokens, 4096)
+            if args.context_length and args.context_length < needed_tokens:
+                raise ValueError(f"Requested context {args.context_length} is below the conservative task/output budget {needed_tokens}; increase --context-length")
 
             sampler = (
                 MetricsSampler(vllm_metrics_url, vllm_hardware_url=vllm_hardware_url)
@@ -1081,6 +1202,7 @@ def main():
                             generation_timeout_seconds=args.generation_timeout_seconds,
                             custom_tasks=bench_tasks,
                             **openai_request_options,
+                            **request_options,
                         )
                         for r in batch:
                             r["decision_repeat"] = rep
@@ -1099,12 +1221,14 @@ def main():
                         concurrency=concurrency,
                         store_responses=needs_quality,
                         min_ctx=bench_min_ctx,
+                        sampling=sampling if engine in {"ollama", "vllm"} else None,
                         prompt_strategy=target_strategy,
                         custom_system_prompt=selected_prompt["system_prompt"] if selected_prompt else None,
                         max_output_tokens=args.max_output_tokens,
                         generation_timeout_seconds=args.generation_timeout_seconds,
                         custom_tasks=bench_tasks,
                         **openai_request_options,
+                        **request_options,
                     )
             finally:
                 if sampler:
@@ -1134,11 +1258,12 @@ def main():
                     str(args.tasks_per_category) if args.tasks_per_category is not None else "all"
                 ),
                 "task_selection_policy": "sha256_task_id" if args.tasks_per_category is not None else "complete",
-                "temperature": "0.8" if args.decision_mode else "0.0",
+                "temperature": "0.8" if args.decision_mode else str(sampling["temperature"]),
+                "response_format": args.response_format,
                 "seed_policy": (
                     f"100..{99 + runs}" if args.decision_mode
                     else "unset" if engine == "openai-compatible"
-                    else "42"
+                    else str(sampling["seed"])
                 ),
                 "reasoning_policy": "native",
                 "reasoning_effort": (
@@ -1152,11 +1277,19 @@ def main():
                 "requested_min_context": (
                     None if engine == "openai-compatible" else str(bench_min_ctx)
                 ),
-                "quantization": args.quantization,
+                "context_length_policy": "explicit" if args.context_length is not None else "automatic_task_budget" if engine == "ollama" else "server_defined",
+                "context_length_requested": str(args.context_length) if args.context_length is not None else None,
+                "quantization": args.vllm_quantization or args.quantization,
                 "model_revision": args.model_revision,
                 "prompt_id": selected_prompt["id"] if selected_prompt else None,
                 "prompt_sha256": selected_prompt["content_hash"] if selected_prompt else None,
             }
+            submitted_engine_config.update(startup_metadata)
+            if engine == "ollama":
+                submitted_engine_config["runtime_configuration_source"] = "ollama_request_options"
+                submitted_engine_config["context_source"] = "ollama_api_ps_or_unavailable"
+            elif engine == "vllm":
+                submitted_engine_config["context_source"] = "vllm_models_or_unavailable"
             if provider_endpoint_hash:
                 submitted_engine_config["provider_endpoint_sha256"] = provider_endpoint_hash
             summary = summarise(
@@ -1168,7 +1301,7 @@ def main():
                 context_len=None,
                 concurrency=concurrency,
                 pipeline_config_id=args.pipeline_config_id,
-                quantization=args.quantization,
+                quantization=args.vllm_quantization or args.quantization,
                 model_revision=args.model_revision,
                 engine_config=submitted_engine_config,
             )
@@ -1439,6 +1572,18 @@ def main():
     except Exception as e:
         print(f"Error during benchmark or submission: {e}", file=sys.stderr)
         sys.exit(1)
+
+def main():
+    try:
+        with ExitStack() as resources:
+            _main(resources)
+    except KeyboardInterrupt:
+        print("\nInterrupted. Completed outbox files remain available for replay.", file=sys.stderr)
+        raise SystemExit(130)
+    except EOFError:
+        print("Input ended. Supply all required CLI flags for a non-interactive run.", file=sys.stderr)
+        raise SystemExit(2)
+
 
 if __name__ == "__main__":
     main()
