@@ -1,6 +1,6 @@
 """Companion hardware-info HTTP server — runs on the GPU host.
 
-Serves a single JSON endpoint so the benchmark backend can discover the
+Serves a single JSON endpoint so the benchmark runner can discover the
 hardware facts of a remote vLLM instance without SSH or cloud API access.
 
 Endpoints:
@@ -14,12 +14,11 @@ Design decisions:
   null GPU fields — it does NOT crash-loop. A crash-looping companion would
   appear as "remote_unreachable" to the backend, which is the safe outcome,
   but staying up with null GPU fields is more informative.
-- Stdlib only (http.server) — no FastAPI dependency on the GPU host.
-- Binds 0.0.0.0 so it's reachable from the Mac backend over the network.
-  Restrict access via EC2 security groups (port 8081 to your IP only).
+- Uses http.server; install the runner requirements for hardware detection and metrics.
+- Binds 0.0.0.0 for remote runners. Restrict port 8081 to trusted hosts.
 
-Usage (started by docker compose --profile gpu):
-  python src/hardware_server.py [--port 8081]
+Usage (from the runner repository root):
+  python -m src.hardware_server --port 8081
 """
 from __future__ import annotations
 
