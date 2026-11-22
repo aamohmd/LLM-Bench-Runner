@@ -62,9 +62,11 @@ class MetricsSampler:
         try:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                stderr=subprocess.STDOUT
+                stderr=subprocess.STDOUT,
+                timeout=5,
             )
-            return float(out.decode().strip().splitlines()[0])
+            values = [float(line.strip()) for line in out.decode().splitlines() if line.strip()]
+            return sum(values) if values else None
         except (subprocess.SubprocessError, ValueError, FileNotFoundError):
             return None
 

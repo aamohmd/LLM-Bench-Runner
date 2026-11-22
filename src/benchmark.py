@@ -11,7 +11,7 @@ import platform
 import statistics
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import UUID, uuid5
@@ -1013,7 +1013,7 @@ def summarise(
         quant_val = metadata.get("quantization")
 
     result = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": model,
         "prompt_category": prompt_category,
         "mode": mode,

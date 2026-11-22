@@ -2,8 +2,14 @@ from pathlib import Path
 
 import pytest
 import requests
+from datetime import datetime, timedelta
 
 from src import benchmark
+
+
+def test_summary_timestamp_has_explicit_utc_offset():
+    summary = benchmark.summarise("model", "synthetic", "warm", [], engine="vllm")
+    assert datetime.fromisoformat(summary["timestamp"]).utcoffset() == timedelta(0)
 
 
 def test_summarise_framework_labeling_matches_engine() -> None:
